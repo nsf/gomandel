@@ -5,9 +5,10 @@ import (
 	"gl"
 	"unsafe"
 	"flag"
+	"runtime"
 )
 
-var iterations *int = flag.Int("i", 64, "number of iterations")
+var iterations *int = flag.Int("i", 128, "number of iterations")
 
 func drawQuad(x, y, w, h int, u, v, u2, v2 float) {
 	gl.Begin(gl.QUADS)
@@ -116,28 +117,37 @@ type Rect struct {
 	W, H float64
 }
 
-func mandelbrot(w, h int, what Rect) []byte {
-	data := make([]byte, w * h * 4)
-	stepx := what.W / float64(w)
-	stepy := what.H / float64(h)
+func mandelbrot(w, h int, what Rect, discard chan bool) <-chan []byte {
+	result := make(chan []byte)
+	go func() {
+		data := make([]byte, w * h * 4)
+		stepx := what.W / float64(w)
+		stepy := what.H / float64(h)
 
-	for y := 0; y < h; y++ {
-		i := float64(y) * stepy + what.Y
+		for y := 0; y < h; y++ {
+			i := float64(y) * stepy + what.Y
 
-		for x := 0; x < w; x++ {
-			r := float64(x) * stepx + what.X
-			c := cmplx(r, i)
+			for x := 0; x < w; x++ {
+				r := float64(x) * stepx + what.X
+				c := cmplx(r, i)
 
-			offset := y * w * 4 + x * 4
-			color := mandelbrotAt(c)
-			data[offset+0] = color.R
-			data[offset+1] = color.G
-			data[offset+2] = color.B
-			data[offset+3] = color.A
+				offset := y * w * 4 + x * 4
+				color := mandelbrotAt(c)
+				data[offset+0] = color.R
+				data[offset+1] = color.G
+				data[offset+2] = color.B
+				data[offset+3] = color.A
+			}
+			_, ok := <-discard
+			if ok {
+				result <- nil
+				return
+			}
 		}
-	}
+		result <- data
+	}()
 
-	return data
+	return result
 }
 
 //-------------------------------------------------------------------------
@@ -216,7 +226,11 @@ func rectFromSelection(p1, p2 Point, scrw, scrh int, cur Rect) Rect {
 	return r
 }
 
-func texCoordsFromSelection(p1, p2 Point, w, h int) (tx, ty, tx2, ty2 float) {
+type TexCoords struct {
+	TX, TY, TX2, TY2 float
+}
+
+func texCoordsFromSelection(p1, p2 Point, w, h int, tcold TexCoords) (tc TexCoords) {
 	min, max := minMaxPoints(p1, p2)
 	cw, ch := max.X - min.X, max.Y - min.Y
 	if cw < ch {
@@ -229,17 +243,21 @@ func texCoordsFromSelection(p1, p2 Point, w, h int) (tx, ty, tx2, ty2 float) {
 		max.Y += dif
 	}
 
-	stepx := 1 / float(w)
-	stepy := 1 / float(h)
+	modx := tcold.TX2 - tcold.TX
+	mody := tcold.TY2 - tcold.TY
 
-	tx = float(min.X) * stepx
-	tx2 = float(max.X) * stepx
-	ty = float(min.Y) * stepy
-	ty2 = float(max.Y) * stepy
+	stepx := (1 / float(w)) * modx
+	stepy := (1 / float(h)) * mody
+
+	tc.TX = tcold.TX + float(min.X) * stepx
+	tc.TX2 = tcold.TX + float(max.X) * stepx
+	tc.TY = tcold.TY + float(min.Y) * stepy
+	tc.TY2 = tcold.TY + float(max.Y) * stepy
 	return
 }
 
 func main() {
+	runtime.LockOSThread()
 	flag.Parse()
 	buildPalette()
 	sdl.Init(sdl.INIT_VIDEO)
@@ -265,14 +283,21 @@ func main() {
 
 	gl.ClearColor(0, 0, 0, 0)
 
+	discarder := make(chan bool)
 	rect := Rect{-1.5,-1.5,3,3}
-	data := mandelbrot(512, 512, rect)
+
+	result := mandelbrot(512, 512, rect, discarder)
+
+	data := <-result
 	tex := uploadTexture_RGBA32(512, 512, data)
+
+	result = nil
 
 	//-----------------------------------------------------------------------------
 	var dndDragging bool = false
 	var dndStart Point
 	var dndEnd Point
+	tc := TexCoords{0,0,1,1}
 
 	running := true
 	e := new(sdl.Event)
@@ -289,26 +314,38 @@ func main() {
 				dndDragging = false
 				sdl.GetMouseState(&dndEnd.X, &dndEnd.Y)
 				rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
-				tx, ty, tx2, ty2 := texCoordsFromSelection(dndStart, dndEnd, 512, 512)
-				gl.Clear(gl.COLOR_BUFFER_BIT)
-				gl.BindTexture(gl.TEXTURE_2D, tex)
-				drawQuad(0,0,512,512,tx,ty,tx2,ty2)
-				gl.BindTexture(gl.TEXTURE_2D, 0)
-				sdl.GL_SwapBuffers()
+				tc = texCoordsFromSelection(dndStart, dndEnd, 512, 512, tc)
 
-				gl.DeleteTextures(1, &tex)
-				data = mandelbrot(512, 512, rect)
-				tex = uploadTexture_RGBA32(512, 512, data)
+				// make a request
+				if result != nil {
+					// if something is pending, stop it!
+					discarder <- true
+
+					// wait for response
+					<-result
+					print("DONE!\n")
+				}
+				result = mandelbrot(512, 512, rect, discarder)
 			case sdl.MOUSEMOTION:
 				if dndDragging {
 					sdl.GetMouseState(&dndEnd.X, &dndEnd.Y)
 				}
 			}
 		}
+		// if we're waiting for a result, check if it's ready
+		if result != nil {
+			data, ok := <-result
+			if ok {
+				gl.DeleteTextures(1, &tex)
+				tex = uploadTexture_RGBA32(512, 512, data)
+				result = nil
+				tc = TexCoords{0, 0, 1, 1}
+			}
+		}
 
 		gl.Clear(gl.COLOR_BUFFER_BIT)
 		gl.BindTexture(gl.TEXTURE_2D, tex)
-		drawQuad(0,0,512,512,0,0,1,1)
+		drawQuad(0,0,512,512,tc.TX,tc.TY,tc.TX2,tc.TY2)
 		gl.BindTexture(gl.TEXTURE_2D, 0)
 		if dndDragging {
 			drawSelection(dndStart, dndEnd)
