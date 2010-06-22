@@ -1,0 +1,6 @@
+Simple mandelbrot demo written in Go.
+
+Uses OpenGL + SDL for displaying. Draws mandelbrot in software.
+
+It is currently possible only to zoom in. Simple click'n'hold mouse button and
+drag.
