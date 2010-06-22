@@ -8,7 +8,7 @@ import (
 	"runtime"
 )
 
-var iterations *int = flag.Int("i", 128, "number of iterations")
+var iterations *int = flag.Int("i", 1024, "number of iterations")
 
 func drawQuad(x, y, w, h int, u, v, u2, v2 float) {
 	gl.Begin(gl.QUADS)
@@ -117,7 +117,7 @@ type Rect struct {
 	W, H float64
 }
 
-func mandelbrot(w, h int, what Rect, discard <-chan bool) <-chan []byte {
+func mandelbrot(w, h int, what Rect, discard <-chan bool, progress chan int) <-chan []byte {
 	result := make(chan []byte)
 	go func() {
 		data := make([]byte, w * h * 4)
@@ -141,6 +141,18 @@ func mandelbrot(w, h int, what Rect, discard <-chan bool) <-chan []byte {
 			_, ok := <-discard
 			if ok {
 				return
+			}
+
+			// discard value if we have something
+			_, ok = <-progress
+			if len(progress) == 0 {
+				percents := int(float(y) / float(h-1) * 100)
+				if percents < 0 {
+					percents = 0
+				} else if percents > 100 {
+					percents = 100
+				}
+				progress <- percents
 			}
 		}
 		result <- data
@@ -173,6 +185,27 @@ func minMaxPoints(p1, p2 Point) (min, max Point) {
 	max.X = MaxInt(p1.X, p2.X)
 	max.Y = MaxInt(p1.Y, p2.Y)
 	return
+}
+
+const BarSize = 8
+
+func drawProgress(w, h, percents, pending int) {
+	switch pending {
+	case None:
+		gl.Color3ub(200,0,0)
+		drawQuad(0,h-BarSize, w, BarSize, 0, 0, 1, 1)
+		gl.Color3ub(255,255,255)
+		return
+	case Small:
+		gl.Color3ub(0,200,200)
+	case Big:
+		gl.Color3ub(0,200,200)
+		drawQuad(0, h-BarSize, w, BarSize, 0, 0, 1, 1)
+		gl.Color3ub(200,0,0)
+	}
+	step := float(w) / 100
+	drawQuad(0, h-BarSize, int(float(percents) * step), BarSize, 0, 0, 1, 1)
+	gl.Color3ub(255,255,255)
 }
 
 func drawSelection(p1, p2 Point) {
@@ -252,6 +285,108 @@ func texCoordsFromSelection(p1, p2 Point, w, h int, tcold TexCoords) (tc TexCoor
 }
 
 //-------------------------------------------------------------------------
+// MandelbrotRequest
+//
+// Mandelbrot drawing request abstraction, controls drawing goroutines
+// and builds textures
+//-------------------------------------------------------------------------
+
+const None = 0
+const Small = 1
+const Big = 2
+
+const SmallSize = 256
+
+type MandelbrotRequest struct {
+	Texture gl.GLuint
+	Discarder chan bool
+	Result <-chan []byte
+	Progress chan int
+
+	W, H int
+	What Rect
+
+	Pending int
+	PercentsReady int
+}
+
+func ReuploadTexture(tex *gl.GLuint, w, h int, data []byte) {
+	if *tex > 0 {
+		gl.DeleteTextures(1, tex)
+	}
+	*tex = uploadTexture_RGBA32(w, h, data)
+}
+
+func (self *MandelbrotRequest) MakeRequest(w, h int, what Rect) {
+	self.Drop()
+	self.W = w
+	self.H = h
+	self.What = what
+	self.Discarder = make(chan bool)
+	self.Progress = make(chan int, 250)
+
+	// request small first
+	self.Pending = Small
+	self.Result = mandelbrot(SmallSize, SmallSize, what, self.Discarder, self.Progress)
+}
+
+func (self *MandelbrotRequest) makeBigRequest() {
+	self.Pending = Big
+	self.Result = mandelbrot(self.W, self.H, self.What, self.Discarder, self.Progress)
+}
+
+func (self *MandelbrotRequest) Drop() {
+	if self.Pending > 0 {
+		self.Discarder <- true
+		self.Pending = None
+	}
+}
+
+func (self *MandelbrotRequest) Update(tex *gl.GLuint, tc *TexCoords) int {
+	// if request is pending check status
+	progress := -1
+	if self.Pending > 0 {
+		if p, ok := <-self.Progress; ok {
+			progress = p
+		}
+
+		// if something is finished
+		if data, ok := <-self.Result; ok {
+			switch self.Pending {
+			case Small:
+				// this was a small image
+				ReuploadTexture(tex, SmallSize, SmallSize, data)
+				self.makeBigRequest()
+			case Big:
+				ReuploadTexture(tex, self.W, self.H, data)
+				self.Pending = None
+			default:
+				panic("unreachable")
+			}
+			*tc = TexCoords{0,0,1,1}
+			progress = 0
+		}
+	}
+	return progress
+}
+
+func (self *MandelbrotRequest) WaitFor(pending int, tex *gl.GLuint, tc *TexCoords) {
+	*tc = TexCoords{0,0,1,1}
+	switch pending {
+	case Small:
+		data := <-self.Result
+		ReuploadTexture(tex, SmallSize, SmallSize, data)
+		self.makeBigRequest()
+	case Big:
+		self.Drop()
+		self.makeBigRequest()
+		data := <-self.Result
+		ReuploadTexture(tex, self.W, self.H, data)
+		self.Pending = None
+	}
+}
+
+//-------------------------------------------------------------------------
 // main()
 //-------------------------------------------------------------------------
 
@@ -282,21 +417,19 @@ func main() {
 
 	gl.ClearColor(0, 0, 0, 0)
 
-	discarder := make(chan bool)
-	rect := Rect{-1.5,-1.5,3,3}
-
-	result := mandelbrot(512, 512, rect, discarder)
-
-	data := <-result
-	tex := uploadTexture_RGBA32(512, 512, data)
-
-	result = nil
 
 	//-----------------------------------------------------------------------------
 	var dndDragging bool = false
 	var dndStart Point
 	var dndEnd Point
-	tc := TexCoords{0,0,1,1}
+	var tex gl.GLuint
+	var tc TexCoords
+	var lastProgress int
+	rect := Rect{-1.5,-1.5,3,3}
+
+	rc := new(MandelbrotRequest)
+	rc.MakeRequest(512, 512, rect)
+	rc.WaitFor(Small, &tex, &tc)
 
 	running := true
 	e := new(sdl.Event)
@@ -315,29 +448,19 @@ func main() {
 				rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
 				tc = texCoordsFromSelection(dndStart, dndEnd, 512, 512, tc)
 
-				// if something is pending, stop it!
-				if result != nil {
-					discarder <- true
-				}
-				// make a request
-				discarder = make(chan bool)
-				result = mandelbrot(512, 512, rect, discarder)
+				// make request
+				rc.MakeRequest(512, 512, rect)
 			case sdl.MOUSEMOTION:
 				if dndDragging {
 					sdl.GetMouseState(&dndEnd.X, &dndEnd.Y)
 				}
 			}
 		}
-		// if we're waiting for a result, check if it's ready
-		if result != nil {
-			if data, ok := <-result; ok {
-				gl.DeleteTextures(1, &tex)
-				tex = uploadTexture_RGBA32(512, 512, data)
 
-				// drop channel and reset texture coords
-				result = nil
-				tc = TexCoords{0, 0, 1, 1}
-			}
+		// if we're waiting for a result, check if it's ready
+		p := rc.Update(&tex, &tc)
+		if p != -1 {
+			lastProgress = p
 		}
 
 		gl.Clear(gl.COLOR_BUFFER_BIT)
@@ -347,6 +470,7 @@ func main() {
 		if dndDragging {
 			drawSelection(dndStart, dndEnd)
 		}
+		drawProgress(512, 512, lastProgress, rc.Pending)
 		sdl.GL_SwapBuffers()
 	}
 }
