@@ -117,7 +117,7 @@ type Rect struct {
 	W, H float64
 }
 
-func mandelbrot(w, h int, what Rect, discard chan bool) <-chan []byte {
+func mandelbrot(w, h int, what Rect, discard <-chan bool) <-chan []byte {
 	result := make(chan []byte)
 	go func() {
 		data := make([]byte, w * h * 4)
@@ -140,7 +140,6 @@ func mandelbrot(w, h int, what Rect, discard chan bool) <-chan []byte {
 			}
 			_, ok := <-discard
 			if ok {
-				result <- nil
 				return
 			}
 		}
@@ -149,10 +148,6 @@ func mandelbrot(w, h int, what Rect, discard chan bool) <-chan []byte {
 
 	return result
 }
-
-//-------------------------------------------------------------------------
-// main()
-//-------------------------------------------------------------------------
 
 type Point struct {
 	X, Y int
@@ -256,6 +251,10 @@ func texCoordsFromSelection(p1, p2 Point, w, h int, tcold TexCoords) (tc TexCoor
 	return
 }
 
+//-------------------------------------------------------------------------
+// main()
+//-------------------------------------------------------------------------
+
 func main() {
 	runtime.LockOSThread()
 	flag.Parse()
@@ -316,14 +315,12 @@ func main() {
 				rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
 				tc = texCoordsFromSelection(dndStart, dndEnd, 512, 512, tc)
 
-				// make a request
+				// if something is pending, stop it!
 				if result != nil {
-					// if something is pending, stop it!
 					discarder <- true
-
-					// wait for response
-					<-result
 				}
+				// make a request
+				discarder = make(chan bool)
 				result = mandelbrot(512, 512, rect, discarder)
 			case sdl.MOUSEMOTION:
 				if dndDragging {
@@ -333,10 +330,11 @@ func main() {
 		}
 		// if we're waiting for a result, check if it's ready
 		if result != nil {
-			data, ok := <-result
-			if ok {
+			if data, ok := <-result; ok {
 				gl.DeleteTextures(1, &tex)
 				tex = uploadTexture_RGBA32(512, 512, data)
+
+				// drop channel and reset texture coords
 				result = nil
 				tc = TexCoords{0, 0, 1, 1}
 			}
