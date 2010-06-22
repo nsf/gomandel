@@ -197,9 +197,9 @@ func drawProgress(w, h, percents, pending int) {
 		gl.Color3ub(255,255,255)
 		return
 	case Small:
-		gl.Color3ub(0,200,200)
+		gl.Color3ub(200,200,0)
 	case Big:
-		gl.Color3ub(0,200,200)
+		gl.Color3ub(200,200,0)
 		drawQuad(0, h-BarSize, w, BarSize, 0, 0, 1, 1)
 		gl.Color3ub(200,0,0)
 	}
@@ -425,7 +425,8 @@ func main() {
 	var tex gl.GLuint
 	var tc TexCoords
 	var lastProgress int
-	rect := Rect{-1.5,-1.5,3,3}
+	initialRect := Rect{-1.5,-1.5,3,3}
+	rect := initialRect
 
 	rc := new(MandelbrotRequest)
 	rc.MakeRequest(512, 512, rect)
@@ -445,8 +446,12 @@ func main() {
 			case sdl.MOUSEBUTTONUP:
 				dndDragging = false
 				sdl.GetMouseState(&dndEnd.X, &dndEnd.Y)
-				rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
-				tc = texCoordsFromSelection(dndStart, dndEnd, 512, 512, tc)
+				if e.MouseButton().Button == 3 {
+					rect = initialRect
+				} else {
+					rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
+					tc = texCoordsFromSelection(dndStart, dndEnd, 512, 512, tc)
+				}
 
 				// make request
 				rc.MakeRequest(512, 512, rect)
