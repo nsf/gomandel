@@ -323,7 +323,6 @@ func main() {
 
 					// wait for response
 					<-result
-					print("DONE!\n")
 				}
 				result = mandelbrot(512, 512, rect, discarder)
 			case sdl.MOUSEMOTION:
