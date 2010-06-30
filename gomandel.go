@@ -5,10 +5,15 @@ import (
 	"gl"
 	"unsafe"
 	"flag"
+	"fmt"
 	"runtime"
+	"container/list"
 )
 
-var iterations *int = flag.Int("i", 1024, "number of iterations")
+var iterations = flag.Int("i", 1024, "number of iterations in mandelbrot")
+var workers = flag.Int("w", 4, "number of rendering workers")
+var tilesDiv = flag.Int("t", 8, "affects number of tiles, should be power of two")
+var noVSync = flag.Bool("no-vsync", false, "disables vsync")
 
 func drawQuad(x, y, w, h int, u, v, u2, v2 float) {
 	gl.Begin(gl.QUADS)
@@ -44,7 +49,6 @@ func uploadTexture_RGBA32(w, h int, data []byte) gl.GLuint {
 	if gl.GetError() != gl.NO_ERROR {
 		gl.DeleteTextures(1, &id)
 		panic("Failed to load a texture")
-		return 0
 	}
 	return id
 }
@@ -117,49 +121,176 @@ type Rect struct {
 	W, H float64
 }
 
-func mandelbrot(w, h int, what Rect, discard <-chan bool, progress chan int) <-chan []byte {
-	result := make(chan []byte)
-	go func() {
-		data := make([]byte, w * h * 4)
-		stepx := what.W / float64(w)
-		stepy := what.H / float64(h)
-
-		for y := 0; y < h; y++ {
-			i := float64(y) * stepy + what.Y
-
-			for x := 0; x < w; x++ {
-				r := float64(x) * stepx + what.X
-				c := cmplx(r, i)
-
-				offset := y * w * 4 + x * 4
-				color := mandelbrotAt(c)
-				data[offset+0] = color.R
-				data[offset+1] = color.G
-				data[offset+2] = color.B
-				data[offset+3] = color.A
-			}
-			_, ok := <-discard
-			if ok {
-				return
-			}
-
-			// discard value if we have something
-			_, ok = <-progress
-			if len(progress) == 0 {
-				percents := int(float(y) / float(h-1) * 100)
-				if percents < 0 {
-					percents = 0
-				} else if percents > 100 {
-					percents = 100
-				}
-				progress <- percents
-			}
-		}
-		result <- data
-	}()
-
-	return result
+func (self *Rect) Center() (x, y float64) {
+	x = self.X + self.W / 2
+	y = self.Y + self.H / 2
+	return
 }
+
+type MandelbrotRequest struct {
+	Width int
+	Height int
+	What Rect
+	Discarder <-chan bool
+}
+
+func mandelbrotProcessRequest(req *MandelbrotRequest) []byte {
+	data := make([]byte, req.Width * req.Height * 4)
+	stepx := req.What.W / float64(req.Width)
+	stepy := req.What.H / float64(req.Height)
+
+	for y := 0; y < req.Height; y++ {
+		i := float64(y) * stepy + req.What.Y
+
+		for x := 0; x < req.Width; x++ {
+			r := float64(x) * stepx + req.What.X
+			c := cmplx(r, i)
+
+			offset := y * req.Width * 4 + x * 4
+			color := mandelbrotAt(c)
+			data[offset+0] = color.R
+			data[offset+1] = color.G
+			data[offset+2] = color.B
+			data[offset+3] = color.A
+		}
+		_, ok := <-req.Discarder
+		if ok {
+			return nil
+		}
+	}
+	return data
+
+}
+
+func mandelbrotService(in <-chan *MandelbrotRequest) <-chan []byte {
+	out := make(chan []byte)
+	go func() {
+		for {
+			request := <-in
+			out <- mandelbrotProcessRequest(request)
+		}
+	}()
+	return out
+}
+
+//-------------------------------------------------------------------------
+// MandelbrotService
+//-------------------------------------------------------------------------
+
+type MandelbrotService struct {
+	In chan<- *MandelbrotRequest
+	Out <-chan []byte
+	Tile *Tile // non-nil, means service is busy
+	LastRequest *MandelbrotRequest
+}
+
+func NewMandelbrotService() *MandelbrotService {
+	self := new(MandelbrotService)
+	in := make(chan *MandelbrotRequest)
+	self.In = in
+	self.Out = mandelbrotService(in)
+	return self
+}
+
+func (self *MandelbrotService) Request(req *MandelbrotRequest, tile *Tile) bool {
+	if !self.Busy() {
+		self.In <- req
+		self.Tile = tile
+		self.LastRequest = req
+		return true
+	}
+	return false
+}
+
+// returns (data, associated tile) on success
+// (nil, nil) on failure
+func (self *MandelbrotService) Done() ([]byte, *Tile) {
+	if data, ok := <-self.Out; ok {
+		t := self.Tile
+		self.Tile = nil
+		if _, ok := <-self.LastRequest.Discarder; ok {
+			return nil, nil
+		}
+		return data, t
+	}
+	return nil, nil
+}
+
+func (self *MandelbrotService) Busy() bool {
+	return self.Tile != nil
+}
+
+//-------------------------------------------------------------------------
+// MandelbrotQueue
+//-------------------------------------------------------------------------
+
+type MandelbrotQueueElem struct {
+	Request *MandelbrotRequest
+	Tile *Tile
+}
+
+type MandelbrotQueue struct {
+	Services []*MandelbrotService
+	Queue *list.List
+}
+
+func NewMandelbrotQueue() *MandelbrotQueue {
+	self := new(MandelbrotQueue)
+	self.Services = make([]*MandelbrotService, *workers)
+	for i, _ := range self.Services {
+		self.Services[i] = NewMandelbrotService()
+	}
+	self.Queue = list.New()
+	return self
+}
+
+func (self *MandelbrotQueue) Enqueue(w, h int, what Rect, discarder <-chan bool, tile *Tile) {
+	r := &MandelbrotRequest{w, h, what, discarder}
+	e := &MandelbrotQueueElem{r, tile}
+	self.Queue.PushBack(e)
+}
+
+func (self *MandelbrotQueue) FreeService() *MandelbrotService {
+	// we're ready if the queue is not empty and there is at least one non-busy service
+	if self.Queue.Len() == 0 {
+		return nil
+	}
+
+	for _, s := range self.Services {
+		if !s.Busy() {
+			return s
+		}
+	}
+	return nil
+}
+
+func (self *MandelbrotQueue) Update() {
+	for _, s := range self.Services {
+		data, tile := s.Done()
+		if data != nil {
+			tile.ApplyData(data)
+		}
+	}
+	for {
+		if s := self.FreeService(); s != nil {
+			// pop element from the queue and send it to the service
+			front := self.Queue.Front()
+			e := front.Value.(*MandelbrotQueueElem)
+			self.Queue.Remove(front)
+			if _, ok := <-e.Request.Discarder; ok {
+				continue
+			}
+			r := s.Request(e.Request, e.Tile)
+			if !r {
+				panic("Busy?")
+			}
+		} else {
+			break
+		}
+	}
+}
+
+//-------------------------------------------------------------------------
 
 type Point struct {
 	X, Y int
@@ -179,33 +310,26 @@ func MaxInt(i1, i2 int) int {
 	return i2
 }
 
+func MinFloat64(i1, i2 float64) float64 {
+	if i1 < i2 {
+		return i1
+	}
+	return i2
+}
+
+func MaxFloat64(i1, i2 float64) float64 {
+	if i1 > i2 {
+		return i1
+	}
+	return i2
+}
+
 func minMaxPoints(p1, p2 Point) (min, max Point) {
 	min.X = MinInt(p1.X, p2.X)
 	min.Y = MinInt(p1.Y, p2.Y)
 	max.X = MaxInt(p1.X, p2.X)
 	max.Y = MaxInt(p1.Y, p2.Y)
 	return
-}
-
-const BarSize = 8
-
-func drawProgress(w, h, percents, pending int) {
-	switch pending {
-	case None:
-		gl.Color3ub(200,0,0)
-		drawQuad(0,h-BarSize, w, BarSize, 0, 0, 1, 1)
-		gl.Color3ub(255,255,255)
-		return
-	case Small:
-		gl.Color3ub(200,200,0)
-	case Big:
-		gl.Color3ub(200,200,0)
-		drawQuad(0, h-BarSize, w, BarSize, 0, 0, 1, 1)
-		gl.Color3ub(200,0,0)
-	}
-	step := float(w) / 100
-	drawQuad(0, h-BarSize, int(float(percents) * step), BarSize, 0, 0, 1, 1)
-	gl.Color3ub(255,255,255)
 }
 
 func drawSelection(p1, p2 Point) {
@@ -284,106 +408,276 @@ func texCoordsFromSelection(p1, p2 Point, w, h int, tcold TexCoords) (tc TexCoor
 	return
 }
 
-//-------------------------------------------------------------------------
-// MandelbrotRequest
-//
-// Mandelbrot drawing request abstraction, controls drawing goroutines
-// and builds textures
-//-------------------------------------------------------------------------
-
-const None = 0
-const Small = 1
-const Big = 2
-
-const SmallSize = 256
-
-type MandelbrotRequest struct {
-	Texture gl.GLuint
-	Discarder chan bool
-	Result <-chan []byte
-	Progress chan int
-
-	W, H int
-	What Rect
-
-	Pending int
-	PercentsReady int
-}
-
-func ReuploadTexture(tex *gl.GLuint, w, h int, data []byte) {
+func reuploadTexture(tex *gl.GLuint, w, h int, data []byte) {
 	if *tex > 0 {
-		gl.DeleteTextures(1, tex)
+		gl.BindTexture(gl.TEXTURE_2D, *tex)
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.GLsizei(w), gl.GLsizei(h), 0, gl.RGBA,
+			      gl.UNSIGNED_BYTE, unsafe.Pointer(&data[0]))
+
+		if gl.GetError() != gl.NO_ERROR {
+			gl.DeleteTextures(1, tex)
+			panic("Failed to reupload texture")
+		}
+		return
 	}
 	*tex = uploadTexture_RGBA32(w, h, data)
 }
 
-func (self *MandelbrotRequest) MakeRequest(w, h int, what Rect) {
-	self.Drop()
-	self.W = w
-	self.H = h
-	self.What = what
-	self.Discarder = make(chan bool)
-	self.Progress = make(chan int, 250)
+//-------------------------------------------------------------------------
 
-	// request small first
-	self.Pending = Small
-	self.Result = mandelbrot(SmallSize, SmallSize, what, self.Discarder, self.Progress)
+type Tile struct {
+	Texture [2]gl.GLuint	// two LODs
+	CurrentLOD int		// -1 if no texture available
+
+	W, H int
+	SW, SH int // small LOD
+
+	What Rect
+	X, Y int
+
+	// goroutine communication
+	Discarder chan bool
+	Queue *MandelbrotQueue
+	Enqueued bool
 }
 
-func (self *MandelbrotRequest) makeBigRequest() {
-	self.Pending = Big
-	self.Result = mandelbrot(self.W, self.H, self.What, self.Discarder, self.Progress)
+func NewTile(w, h, sw, sh int, queue *MandelbrotQueue) *Tile {
+	self := new(Tile)
+	self.CurrentLOD = -1
+	self.W, self.H = w, h
+	self.SW, self.SH = sw, sh
+	self.Queue = queue
+	self.Enqueued = false
+	return self
 }
 
-func (self *MandelbrotRequest) Drop() {
-	if self.Pending > 0 {
+func (self *Tile) Reset() {
+	if self.Enqueued {
 		self.Discarder <- true
-		self.Pending = None
+		self.Enqueued = false
+	}
+	self.CurrentLOD = -1
+}
+
+func (self *Tile) Request(x, y int, what Rect) {
+	if self.Enqueued {
+		self.Discarder <- true
+	}
+	self.CurrentLOD = -1
+	self.X, self.Y = x, y
+	self.What = what
+	self.Discarder = make(chan bool, 1)
+	self.Enqueued = true
+	self.Queue.Enqueue(self.SW, self.SH, what, self.Discarder, self)
+}
+
+func (self *Tile) ApplyData(data []byte) {
+	switch self.CurrentLOD {
+	case -1:
+		reuploadTexture(&self.Texture[0], self.SW, self.SH, data)
+		self.CurrentLOD = 0
+		self.Queue.Enqueue(self.W, self.H, self.What, self.Discarder, self)
+	case 0:
+		reuploadTexture(&self.Texture[1], self.W, self.H, data)
+		self.CurrentLOD = 1
+		self.Enqueued = false
+	case 1:
+		panic("unreachable")
+	default:
+		panic("unreachable")
 	}
 }
 
-func (self *MandelbrotRequest) Update(tex *gl.GLuint, tc *TexCoords) int {
-	// if request is pending check status
-	progress := -1
-	if self.Pending > 0 {
-		if p, ok := <-self.Progress; ok {
-			progress = p
-		}
+func (self *Tile) Draw() {
+	switch self.CurrentLOD {
+	case -1:
+		// TODO: draw single color
+		r, i := self.What.Center()
+		c := cmplx(r, i)
+		color := mandelbrotAt(c)
+		gl.BindTexture(gl.TEXTURE_2D, 0)
+		gl.Color3ub(gl.GLubyte(color.R), gl.GLubyte(color.G), gl.GLubyte(color.B))
+		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
+		gl.Color3ub(255, 255, 255)
+	case 0:
+		gl.BindTexture(gl.TEXTURE_2D, self.Texture[0])
+		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
+	case 1:
+		gl.BindTexture(gl.TEXTURE_2D, self.Texture[1])
+		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
+	default:
+		panic("unreachable")
+	}
+}
 
-		// if something is finished
-		if data, ok := <-self.Result; ok {
-			switch self.Pending {
-			case Small:
-				// this was a small image
-				ReuploadTexture(tex, SmallSize, SmallSize, data)
-				self.makeBigRequest()
-			case Big:
-				ReuploadTexture(tex, self.W, self.H, data)
-				self.Pending = None
-			default:
-				panic("unreachable")
+//-------------------------------------------------------------------------
+
+type TileManager struct {
+	Queue *MandelbrotQueue
+	Tiles []*Tile
+	LastWhat Rect
+	W, H int // screen size
+	Div int
+	TilePW, TilePH int
+}
+
+func NewTileManager(w, h int) *TileManager {
+	self := new(TileManager)
+	self.Queue = NewMandelbrotQueue()
+	self.W, self.H = w, h
+	self.Div = *tilesDiv
+	self.Tiles = make([]*Tile, (self.Div+1)*(self.Div+1))
+
+	self.TilePW, self.TilePH = w / self.Div, h / self.Div
+	sw, sh := self.TilePW / 4, self.TilePH / 4
+
+	for i := 0; i < len(self.Tiles); i++ {
+		self.Tiles[i] = NewTile(self.TilePW, self.TilePH, sw, sh, self.Queue)
+	}
+	self.Tiles = self.Tiles[0:0]
+	return self
+}
+
+func (self *TileManager) ZoomRequest(what Rect) {
+	// free all tiles
+	self.LastWhat = what
+	self.Tiles = self.Tiles[0:0]
+
+	tilew := what.W / float64(self.Div)
+	tileh := what.H / float64(self.Div)
+	pixw := tilew / float64(self.TilePW)
+	pixh := tileh / float64(self.TilePH)
+
+	ox := what.X - (-1.5)
+	oy := what.Y - (-1.5)
+
+	tx1 := int(ox / tilew)
+	ty1 := int(oy / tileh)
+	tx2 := int((ox + what.W) / tilew)
+	ty2 := int((oy + what.H) / tileh)
+
+	total := (tx2+1 - tx1) * (ty2+1 - ty1)
+	if total > cap(self.Tiles) {
+		panic("Total amount of tiles required exceeds total amount of tiles available")
+	}
+
+	// allocate tiles
+	self.Tiles = self.Tiles[0:total]
+
+	i := 0
+	for y := ty1; y <= ty2; y++ {
+		for x := tx1; x <= tx2; x++ {
+			var r Rect
+			r.X = float64(x) * tilew + (-1.5)
+			r.Y = float64(y) * tileh + (-1.5)
+			r.W = tilew
+			r.H = tileh
+			px := int((r.X - what.X) / pixw)
+			py := int((r.Y - what.Y) / pixh)
+			self.Tiles[i].Request(px, py, r)
+			i++
+		}
+	}
+}
+
+func overlaps(r1, r2 Rect) bool {
+	maxX := MaxFloat64(r1.X, r2.X)
+	minX := MinFloat64(r1.X + r1.W, r2.X + r2.W)
+	ix := minX > maxX
+
+	maxY := MaxFloat64(r1.Y, r2.Y)
+	minY := MinFloat64(r1.Y + r1.H, r2.Y + r2.H)
+	iy := minY > maxY
+	return ix && iy
+}
+
+func (self *TileManager) MoveRequest(what Rect) {
+	// in move request we have to be careful with tiles, 
+	// because some of them are pretty valid
+	tilew := what.W / float64(self.Div)
+	tileh := what.H / float64(self.Div)
+	pixw := tilew / float64(self.TilePW)
+	pixh := tileh / float64(self.TilePH)
+
+	for i := 0; i < len(self.Tiles); i++ {
+		t := self.Tiles[i]
+		if overlaps(t.What, what) {
+			t.X = int((t.What.X - what.X) / pixw)
+			t.Y = int((t.What.Y - what.Y) / pixh)
+		} else {
+			self.Tiles[i].Reset()
+			last := len(self.Tiles) - 1
+			self.Tiles[i], self.Tiles[last] = self.Tiles[last], self.Tiles[i]
+			self.Tiles = self.Tiles[0:last]
+			i--
+		}
+	}
+
+	ox := what.X - (-1.5)
+	oy := what.Y - (-1.5)
+
+	tx1 := int(ox / tilew)
+	ty1 := int(oy / tileh)
+	tx2 := int((ox + what.W) / tilew)
+	ty2 := int((oy + what.H) / tileh)
+
+	total := (tx2+1 - tx1) * (ty2+1 - ty1)
+	if total > cap(self.Tiles) {
+		panic("Total amount of tiles required exceeds total amount of tiles available")
+	}
+
+	i := len(self.Tiles)
+	// allocate tiles
+	self.Tiles = self.Tiles[0:total]
+
+	for y := ty1; y <= ty2; y++ {
+		for x := tx1; x <= tx2; x++ {
+			var r Rect
+			r.X = float64(x) * tilew + (-1.5)
+			r.Y = float64(y) * tileh + (-1.5)
+			r.W = tilew
+			r.H = tileh
+			if !overlaps(r, self.LastWhat) {
+				// this tile was newly introduced
+				px := int((r.X - what.X) / pixw)
+				py := int((r.Y - what.Y) / pixh)
+				if i >= len(self.Tiles) {
+					fmt.Printf("missing free tiles: %f %f %f %f (%f %f %f %f) [%d]\n",
+						   r.X, r.Y, r.W, r.H,
+						   what.X, what.Y, what.W, what.H, i)
+				} else {
+					self.Tiles[i].Request(px, py, r)
+				}
+				i++
 			}
-			*tc = TexCoords{0,0,1,1}
-			progress = 0
 		}
 	}
-	return progress
+	self.LastWhat = what
 }
 
-func (self *MandelbrotRequest) WaitFor(pending int, tex *gl.GLuint, tc *TexCoords) {
-	*tc = TexCoords{0,0,1,1}
-	switch pending {
-	case Small:
-		data := <-self.Result
-		ReuploadTexture(tex, SmallSize, SmallSize, data)
-		self.makeBigRequest()
-	case Big:
-		self.Drop()
-		self.makeBigRequest()
-		data := <-self.Result
-		ReuploadTexture(tex, self.W, self.H, data)
-		self.Pending = None
+func (self *TileManager) Update() {
+	self.Queue.Update()
+}
+
+func (self *TileManager) Draw() {
+	for i := 0; i < len(self.Tiles); i++ {
+		self.Tiles[i].Draw()
 	}
+}
+
+func moveRectBy(what Rect, e, s Point, w, h int) Rect {
+	pixw := what.W / float64(w)
+	pixh := what.H / float64(h)
+
+	var r Rect
+	r.X = what.X + float64(e.X - s.X) * pixw
+	r.Y = what.Y + float64(e.Y - s.Y) * pixh
+	r.W = what.W
+	r.H = what.H
+	if r.X < -1.5 || r.Y < -1.5 || (r.X + r.W) > 1.5 || (r.Y + r.H) > 1.5 {
+		return what
+	}
+	return r
 }
 
 //-------------------------------------------------------------------------
@@ -397,7 +691,9 @@ func main() {
 	sdl.Init(sdl.INIT_VIDEO)
 	defer sdl.Quit()
 
-	sdl.GL_SetAttribute(sdl.GL_SWAP_CONTROL, 1)
+	if !*noVSync {
+		sdl.GL_SetAttribute(sdl.GL_SWAP_CONTROL, 1)
+	}
 
 	if sdl.SetVideoMode(512, 512, 32, sdl.OPENGL) == nil {
 		panic("sdl error")
@@ -420,20 +716,18 @@ func main() {
 
 	//-----------------------------------------------------------------------------
 	var dndDragging bool = false
+	var dnd3 bool = false
 	var dndStart Point
 	var dndEnd Point
-	var tex gl.GLuint
-	var tc TexCoords
-	var lastProgress int
 	initialRect := Rect{-1.5,-1.5,3,3}
 	rect := initialRect
 
-	rc := new(MandelbrotRequest)
-	rc.MakeRequest(512, 512, rect)
-	rc.WaitFor(Small, &tex, &tc)
+	tm := NewTileManager(512, 512)
+	tm.ZoomRequest(rect)
 
 	running := true
-	e := new(sdl.Event)
+
+	e := sdl.Event{}
 	for running {
 		for e.Poll() {
 			switch e.Type {
@@ -441,41 +735,49 @@ func main() {
 				running = false
 			case sdl.MOUSEBUTTONDOWN:
 				dndDragging = true
-				sdl.GetMouseState(&dndStart.X, &dndStart.Y)
+				dndStart.X = int(e.MouseButton().X)
+				dndStart.Y = int(e.MouseButton().Y)
 				dndEnd = dndStart
+				if e.MouseButton().Button == 3 {
+					dnd3 = true
+				} else {
+					dndDragging = true
+				}
 			case sdl.MOUSEBUTTONUP:
 				dndDragging = false
-				sdl.GetMouseState(&dndEnd.X, &dndEnd.Y)
-				if e.MouseButton().Button == 3 {
-					rect = initialRect
-				} else {
-					rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
-					tc = texCoordsFromSelection(dndStart, dndEnd, 512, 512, tc)
-				}
+				dndEnd.X = int(e.MouseButton().X)
+				dndEnd.Y = int(e.MouseButton().Y)
 
-				// make request
-				rc.MakeRequest(512, 512, rect)
+				switch e.MouseButton().Button {
+				case 1:
+					rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
+					tm.ZoomRequest(rect)
+				case 2:
+					rect = initialRect
+					tm.ZoomRequest(rect)
+				case 3:
+					dnd3 = false
+				}
 			case sdl.MOUSEMOTION:
-				if dndDragging {
-					sdl.GetMouseState(&dndEnd.X, &dndEnd.Y)
+				if dnd3 {
+					dndEnd.X = int(e.MouseMotion().X)
+					dndEnd.Y = int(e.MouseMotion().Y)
+					rect = moveRectBy(rect, dndStart, dndEnd, 512, 512)
+					tm.MoveRequest(rect)
+					dndStart = dndEnd
+				} else if dndDragging {
+					dndEnd.X = int(e.MouseMotion().X)
+					dndEnd.Y = int(e.MouseMotion().Y)
 				}
 			}
 		}
-
-		// if we're waiting for a result, check if it's ready
-		p := rc.Update(&tex, &tc)
-		if p != -1 {
-			lastProgress = p
-		}
-
+		tm.Update()
 		gl.Clear(gl.COLOR_BUFFER_BIT)
-		gl.BindTexture(gl.TEXTURE_2D, tex)
-		drawQuad(0,0,512,512,tc.TX,tc.TY,tc.TX2,tc.TY2)
+		tm.Draw()
 		gl.BindTexture(gl.TEXTURE_2D, 0)
 		if dndDragging {
 			drawSelection(dndStart, dndEnd)
 		}
-		drawProgress(512, 512, lastProgress, rc.Pending)
 		sdl.GL_SwapBuffers()
 	}
 }
