@@ -11,7 +11,7 @@ import (
 )
 
 var iterations = flag.Int("i", 1024, "number of iterations in mandelbrot")
-var workers = flag.Int("w", 4, "number of rendering workers")
+var workers = flag.Int("w", runtime.GOMAXPROCS(0)-1, "number of rendering workers")
 var tilesDiv = flag.Int("t", 8, "affects number of tiles, should be power of two")
 var noVSync = flag.Bool("no-vsync", false, "disables vsync")
 
@@ -687,6 +687,9 @@ func moveRectBy(what Rect, e, s Point, w, h int) Rect {
 func main() {
 	runtime.LockOSThread()
 	flag.Parse()
+	if *workers <= 0 {
+		*workers = 1
+	}
 	buildPalette()
 	sdl.Init(sdl.INIT_VIDEO)
 	defer sdl.Quit()
