@@ -538,9 +538,9 @@ func NewTileManager(w, h int) *TileManager {
 	return self
 }
 
-func (self *TileManager) ZoomRequest(what Rect) {
+func (self *TileManager) ZoomRequest(what *Rect) {
 	// free all tiles
-	self.LastWhat = what
+	self.LastWhat = *what
 	self.Tiles = self.Tiles[0:0]
 
 	tilew := what.W / float64(self.Div)
@@ -555,6 +555,12 @@ func (self *TileManager) ZoomRequest(what Rect) {
 	ty1 := int(oy / tileh)
 	tx2 := int((ox + what.W) / tilew)
 	ty2 := int((oy + what.H) / tileh)
+	if tx1 == -2147483648 {
+		fmt.Printf("Too close, sorry, zooming out...\n")
+		*what = Rect{-1.5,-1.5,3,3}
+		self.ZoomRequest(what)
+		return
+	}
 
 	total := (tx2+1 - tx1) * (ty2+1 - ty1)
 	if total > cap(self.Tiles) {
@@ -726,7 +732,7 @@ func main() {
 	rect := initialRect
 
 	tm := NewTileManager(512, 512)
-	tm.ZoomRequest(rect)
+	tm.ZoomRequest(&rect)
 
 	running := true
 
@@ -754,10 +760,10 @@ func main() {
 				switch e.MouseButton().Button {
 				case 1:
 					rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
-					tm.ZoomRequest(rect)
+					tm.ZoomRequest(&rect)
 				case 2:
 					rect = initialRect
-					tm.ZoomRequest(rect)
+					tm.ZoomRequest(&rect)
 				case 3:
 					dnd3 = false
 				}
