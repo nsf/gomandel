@@ -3,7 +3,6 @@ package main
 import (
 	"sdl"
 	"gl"
-	"unsafe"
 	"flag"
 	"fmt"
 	"runtime"
@@ -15,39 +14,37 @@ var workers = flag.Int("w", runtime.GOMAXPROCS(0)-1, "number of rendering worker
 var tilesDiv = flag.Int("t", 8, "affects number of tiles, should be power of two")
 var noVSync = flag.Bool("no-vsync", false, "disables vsync")
 
-func drawQuad(x, y, w, h int, u, v, u2, v2 float) {
+func drawQuad(x, y, w, h int, u, v, u2, v2 float32) {
 	gl.Begin(gl.QUADS)
 
-	gl.TexCoord2f(gl.GLfloat(u), gl.GLfloat(v))
-	gl.Vertex2i(gl.GLint(x), gl.GLint(y))
+	gl.TexCoord2f(u, v)
+	gl.Vertex2i(x, y)
 
-	gl.TexCoord2f(gl.GLfloat(u2), gl.GLfloat(v))
-	gl.Vertex2i(gl.GLint(x+w), gl.GLint(y))
+	gl.TexCoord2f(u2, v)
+	gl.Vertex2i(x+w, y)
 
-	gl.TexCoord2f(gl.GLfloat(u2), gl.GLfloat(v2))
-	gl.Vertex2i(gl.GLint(x+w), gl.GLint(y+h))
+	gl.TexCoord2f(u2, v2)
+	gl.Vertex2i(x+w, y+h)
 
-	gl.TexCoord2f(gl.GLfloat(u), gl.GLfloat(v2))
-	gl.Vertex2i(gl.GLint(x), gl.GLint(y+h))
+	gl.TexCoord2f(u, v2)
+	gl.Vertex2i(x, y+h)
 
 	gl.End()
 }
 
-func uploadTexture_RGBA32(w, h int, data []byte) gl.GLuint {
-	var id gl.GLuint
-
-	gl.GenTextures(1, &id)
-	gl.BindTexture(gl.TEXTURE_2D, id)
+func uploadTexture_RGBA32(w, h int, data []byte) gl.Texture {
+	id := gl.GenTexture()
+	id.Bind(gl.TEXTURE_2D)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE)
-	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.GLsizei(w), gl.GLsizei(h), 0, gl.RGBA,
-		      gl.UNSIGNED_BYTE, unsafe.Pointer(&data[0]))
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA,
+		      gl.UNSIGNED_BYTE, data)
 
 	if gl.GetError() != gl.NO_ERROR {
-		gl.DeleteTextures(1, &id)
+		id.Delete()
 		panic("Failed to load a texture")
 	}
 	return id
@@ -59,7 +56,7 @@ type Color struct {
 
 type ColorRange struct {
 	Start, End Color
-	Range float
+	Range float32
 }
 
 var (
@@ -82,12 +79,12 @@ var colorScale = [...]ColorRange{
 
 var palette []Color
 
-func interpolateColor(c1, c2 Color, f float) Color {
+func interpolateColor(c1, c2 Color, f float32) Color {
 	var c Color
-	c.R = byte(float(c1.R) * f + float(c2.R) * (1.0 - f))
-	c.G = byte(float(c1.G) * f + float(c2.G) * (1.0 - f))
-	c.B = byte(float(c1.B) * f + float(c2.B) * (1.0 - f))
-	c.A = byte(float(c1.A) * f + float(c2.A) * (1.0 - f))
+	c.R = byte(float32(c1.R) * f + float32(c2.R) * (1.0 - f))
+	c.G = byte(float32(c1.G) * f + float32(c2.G) * (1.0 - f))
+	c.B = byte(float32(c1.B) * f + float32(c2.B) * (1.0 - f))
+	c.A = byte(float32(c1.A) * f + float32(c2.A) * (1.0 - f))
 	return c
 }
 
@@ -95,9 +92,9 @@ func buildPalette() {
 	palette = make([]Color, *iterations + 1)
 	p := 0
 	for _, r := range colorScale {
-		n := int(r.Range * float(*iterations) + 0.5)
+		n := int(r.Range * float32(*iterations) + 0.5)
 		for i := 0; i < n && p < *iterations; i++ {
-			c := interpolateColor(r.Start, r.End, float(i) / float(n))
+			c := interpolateColor(r.Start, r.End, float32(i) / float32(n))
 			palette[p] = c
 			p++
 		}
@@ -106,7 +103,7 @@ func buildPalette() {
 }
 
 func mandelbrotAt(c complex128) Color {
-	var z complex128 = cmplx(0, 0)
+	var z complex128 = complex(0, 0)
 	for i := 0; i < *iterations; i++ {
 		z = z * z + c
 		if real(z) * real(z) + imag(z) * imag(z) > 4 {
@@ -144,7 +141,7 @@ func mandelbrotProcessRequest(req *MandelbrotRequest) []byte {
 
 		for x := 0; x < req.Width; x++ {
 			r := float64(x) * stepx + req.What.X
-			c := cmplx(r, i)
+			c := complex(r, i)
 
 			offset := y * req.Width * 4 + x * 4
 			color := mandelbrotAt(c)
@@ -153,9 +150,10 @@ func mandelbrotProcessRequest(req *MandelbrotRequest) []byte {
 			data[offset+2] = color.B
 			data[offset+3] = color.A
 		}
-		_, ok := <-req.Discarder
-		if ok {
+		select {
+		case <-req.Discarder:
 			return nil
+		default:
 		}
 	}
 	return data
@@ -205,13 +203,17 @@ func (self *MandelbrotService) Request(req *MandelbrotRequest, tile *Tile) bool 
 // returns (data, associated tile) on success
 // (nil, nil) on failure
 func (self *MandelbrotService) Done() ([]byte, *Tile) {
-	if data, ok := <-self.Out; ok {
+	select {
+	case data := <-self.Out:
 		t := self.Tile
 		self.Tile = nil
-		if _, ok := <-self.LastRequest.Discarder; ok {
+		select {
+		case <-self.LastRequest.Discarder:
 			return nil, nil
+		default:
 		}
 		return data, t
+	default:
 	}
 	return nil, nil
 }
@@ -277,8 +279,10 @@ func (self *MandelbrotQueue) Update() {
 			front := self.Queue.Front()
 			e := front.Value.(*MandelbrotQueueElem)
 			self.Queue.Remove(front)
-			if _, ok := <-e.Request.Discarder; ok {
+			select {
+			case <-e.Request.Discarder:
 				continue
+			default:
 			}
 			r := s.Request(e.Request, e.Tile)
 			if !r {
@@ -337,17 +341,17 @@ func drawSelection(p1, p2 Point) {
 
 	gl.Color3ub(255,0,0)
 	gl.Begin(gl.LINES)
-		gl.Vertex2i(gl.GLint(min.X), gl.GLint(min.Y))
-		gl.Vertex2i(gl.GLint(max.X), gl.GLint(min.Y))
+		gl.Vertex2i(min.X, min.Y)
+		gl.Vertex2i(max.X, min.Y)
 
-		gl.Vertex2i(gl.GLint(min.X), gl.GLint(min.Y))
-		gl.Vertex2i(gl.GLint(min.X), gl.GLint(max.Y))
+		gl.Vertex2i(min.X, min.Y)
+		gl.Vertex2i(min.X, max.Y)
 
-		gl.Vertex2i(gl.GLint(max.X), gl.GLint(max.Y))
-		gl.Vertex2i(gl.GLint(max.X), gl.GLint(min.Y))
+		gl.Vertex2i(max.X, max.Y)
+		gl.Vertex2i(max.X, min.Y)
 
-		gl.Vertex2i(gl.GLint(max.X), gl.GLint(max.Y))
-		gl.Vertex2i(gl.GLint(min.X), gl.GLint(max.Y))
+		gl.Vertex2i(max.X, max.Y)
+		gl.Vertex2i(min.X, max.Y)
 	gl.End()
 	gl.Color3ub(255,255,255)
 }
@@ -379,7 +383,7 @@ func rectFromSelection(p1, p2 Point, scrw, scrh int, cur Rect) Rect {
 }
 
 type TexCoords struct {
-	TX, TY, TX2, TY2 float
+	TX, TY, TX2, TY2 float32
 }
 
 func texCoordsFromSelection(p1, p2 Point, w, h int, tcold TexCoords) (tc TexCoords) {
@@ -398,24 +402,23 @@ func texCoordsFromSelection(p1, p2 Point, w, h int, tcold TexCoords) (tc TexCoor
 	modx := tcold.TX2 - tcold.TX
 	mody := tcold.TY2 - tcold.TY
 
-	stepx := (1 / float(w)) * modx
-	stepy := (1 / float(h)) * mody
+	stepx := (1 / float32(w)) * modx
+	stepy := (1 / float32(h)) * mody
 
-	tc.TX = tcold.TX + float(min.X) * stepx
-	tc.TX2 = tcold.TX + float(max.X) * stepx
-	tc.TY = tcold.TY + float(min.Y) * stepy
-	tc.TY2 = tcold.TY + float(max.Y) * stepy
+	tc.TX = tcold.TX + float32(min.X) * stepx
+	tc.TX2 = tcold.TX + float32(max.X) * stepx
+	tc.TY = tcold.TY + float32(min.Y) * stepy
+	tc.TY2 = tcold.TY + float32(max.Y) * stepy
 	return
 }
 
-func reuploadTexture(tex *gl.GLuint, w, h int, data []byte) {
+func reuploadTexture(tex *gl.Texture, w, h int, data []byte) {
 	if *tex > 0 {
-		gl.BindTexture(gl.TEXTURE_2D, *tex)
-		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.GLsizei(w), gl.GLsizei(h), 0, gl.RGBA,
-			      gl.UNSIGNED_BYTE, unsafe.Pointer(&data[0]))
+		tex.Bind(gl.TEXTURE_2D)
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data)
 
 		if gl.GetError() != gl.NO_ERROR {
-			gl.DeleteTextures(1, tex)
+			tex.Delete()
 			panic("Failed to reupload texture")
 		}
 		return
@@ -426,7 +429,7 @@ func reuploadTexture(tex *gl.GLuint, w, h int, data []byte) {
 //-------------------------------------------------------------------------
 
 type Tile struct {
-	Texture [2]gl.GLuint	// two LODs
+	Texture [2]gl.Texture	// two LODs
 	CurrentLOD int		// -1 if no texture available
 
 	W, H int
@@ -493,17 +496,17 @@ func (self *Tile) Draw() {
 	case -1:
 		// TODO: draw single color
 		r, i := self.What.Center()
-		c := cmplx(r, i)
+		c := complex(r, i)
 		color := mandelbrotAt(c)
 		gl.BindTexture(gl.TEXTURE_2D, 0)
-		gl.Color3ub(gl.GLubyte(color.R), gl.GLubyte(color.G), gl.GLubyte(color.B))
+		gl.Color3ub(color.R, color.G, color.B)
 		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
 		gl.Color3ub(255, 255, 255)
 	case 0:
-		gl.BindTexture(gl.TEXTURE_2D, self.Texture[0])
+		self.Texture[0].Bind(gl.TEXTURE_2D)
 		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
 	case 1:
-		gl.BindTexture(gl.TEXTURE_2D, self.Texture[1])
+		self.Texture[1].Bind(gl.TEXTURE_2D)
 		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
 	default:
 		panic("unreachable")
@@ -735,48 +738,53 @@ func main() {
 	tm.ZoomRequest(&rect)
 
 	running := true
-
-	e := sdl.Event{}
 	for running {
-		for e.Poll() {
-			switch e.Type {
-			case sdl.QUIT:
-				running = false
-			case sdl.MOUSEBUTTONDOWN:
-				dndDragging = true
-				dndStart.X = int(e.MouseButton().X)
-				dndStart.Y = int(e.MouseButton().Y)
-				dndEnd = dndStart
-				if e.MouseButton().Button == 3 {
-					dnd3 = true
-				} else {
-					dndDragging = true
-				}
-			case sdl.MOUSEBUTTONUP:
-				dndDragging = false
-				dndEnd.X = int(e.MouseButton().X)
-				dndEnd.Y = int(e.MouseButton().Y)
+		for {
+			event := sdl.PollEvent()
+			if event == nil {
+				break
+			}
 
-				switch e.MouseButton().Button {
-				case 1:
-					rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
-					tm.ZoomRequest(&rect)
-				case 2:
-					rect = initialRect
-					tm.ZoomRequest(&rect)
-				case 3:
-					dnd3 = false
+			switch e := event.(type) {
+			case *sdl.QuitEvent:
+				running = false
+			case *sdl.MouseButtonEvent:
+				if e.Type == sdl.MOUSEBUTTONDOWN {
+					dndDragging = true
+					dndStart.X = int(e.X)
+					dndStart.Y = int(e.Y)
+					dndEnd = dndStart
+					if e.Button == 3 {
+						dnd3 = true
+					} else {
+						dndDragging = true
+					}
+				} else {
+					dndDragging = false
+					dndEnd.X = int(e.X)
+					dndEnd.Y = int(e.Y)
+
+					switch e.Button {
+					case 1:
+						rect = rectFromSelection(dndStart, dndEnd, 512, 512, rect)
+						tm.ZoomRequest(&rect)
+					case 2:
+						rect = initialRect
+						tm.ZoomRequest(&rect)
+					case 3:
+						dnd3 = false
+					}
 				}
-			case sdl.MOUSEMOTION:
+			case *sdl.MouseMotionEvent:
 				if dnd3 {
-					dndEnd.X = int(e.MouseMotion().X)
-					dndEnd.Y = int(e.MouseMotion().Y)
+					dndEnd.X = int(e.X)
+					dndEnd.Y = int(e.Y)
 					rect = moveRectBy(rect, dndStart, dndEnd, 512, 512)
 					tm.MoveRequest(rect)
 					dndStart = dndEnd
 				} else if dndDragging {
-					dndEnd.X = int(e.MouseMotion().X)
-					dndEnd.Y = int(e.MouseMotion().Y)
+					dndEnd.X = int(e.X)
+					dndEnd.Y = int(e.Y)
 				}
 			}
 		}
