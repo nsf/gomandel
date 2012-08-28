@@ -7,9 +7,5 @@ Available actions:
  MMB - zoom out
  RMB - pan
 
-It is strongly recommended to run this demo using the following GOMAXPROCS
-scheme:
- - on 1 core CPU, run: GOMAXPROCS=2 ./gomandel
- - on 2 core CPU, run: GOMAXPROCS=4 ./gomandel
- - on 4 core CPU, run: GOMAXPROCS=8 ./gomandel
- - etc. (e.g. formula: GOMAXPROCS = Number of CPUs * 2)
+`gomandel -h` for available options, it sets GOMAXPROCS to number of workers + 1
+by default.
