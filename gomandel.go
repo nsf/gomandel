@@ -1,8 +1,8 @@
 package main
 
 import (
-	"sdl"
-	"gl"
+	"github.com/klkblake/Go-SDL/sdl"
+	gl "github.com/chsc/gogl/gl21"
 	"flag"
 	"fmt"
 	"runtime"
@@ -10,48 +10,49 @@ import (
 )
 
 var iterations = flag.Int("i", 1024, "number of iterations in mandelbrot")
-var workers = flag.Int("w", runtime.GOMAXPROCS(0)-1, "number of rendering workers")
+var workers = flag.Int("w", runtime.NumCPU(), "number of rendering workers")
 var tilesDiv = flag.Int("t", 8, "affects number of tiles, should be power of two")
 var noVSync = flag.Bool("no-vsync", false, "disables vsync")
 
 func drawQuad(x, y, w, h int, u, v, u2, v2 float32) {
 	gl.Begin(gl.QUADS)
 
-	gl.TexCoord2f(u, v)
-	gl.Vertex2i(x, y)
+	gl.TexCoord2f(gl.Float(u), gl.Float(v))
+	gl.Vertex2i(gl.Int(x), gl.Int(y))
 
-	gl.TexCoord2f(u2, v)
-	gl.Vertex2i(x+w, y)
+	gl.TexCoord2f(gl.Float(u2), gl.Float(v))
+	gl.Vertex2i(gl.Int(x+w), gl.Int(y))
 
-	gl.TexCoord2f(u2, v2)
-	gl.Vertex2i(x+w, y+h)
+	gl.TexCoord2f(gl.Float(u2), gl.Float(v2))
+	gl.Vertex2i(gl.Int(x+w), gl.Int(y+h))
 
-	gl.TexCoord2f(u, v2)
-	gl.Vertex2i(x, y+h)
+	gl.TexCoord2f(gl.Float(u), gl.Float(v2))
+	gl.Vertex2i(gl.Int(x), gl.Int(y+h))
 
 	gl.End()
 }
 
-func uploadTexture_RGBA32(w, h int, data []byte) gl.Texture {
-	id := gl.GenTexture()
-	id.Bind(gl.TEXTURE_2D)
+func uploadTexture_RGBA32(w, h int, data []byte) gl.Uint {
+	var id gl.Uint
+	gl.GenTextures(1, &id)
+	gl.BindTexture(gl.TEXTURE_2D, id)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE)
 	gl.TexParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE)
-	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA,
-		      gl.UNSIGNED_BYTE, data)
+	gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.Sizei(w), gl.Sizei(h), 0, gl.RGBA,
+		      gl.UNSIGNED_BYTE, gl.Pointer(&data[0]))
 
 	if gl.GetError() != gl.NO_ERROR {
-		id.Delete()
+		gl.DeleteTextures(1, &id)
 		panic("Failed to load a texture")
 	}
 	return id
 }
 
 type Color struct {
-	R, G, B, A byte
+	R, G, B, A gl.Ubyte
 }
 
 type ColorRange struct {
@@ -81,10 +82,10 @@ var palette []Color
 
 func interpolateColor(c1, c2 Color, f float32) Color {
 	var c Color
-	c.R = byte(float32(c1.R) * f + float32(c2.R) * (1.0 - f))
-	c.G = byte(float32(c1.G) * f + float32(c2.G) * (1.0 - f))
-	c.B = byte(float32(c1.B) * f + float32(c2.B) * (1.0 - f))
-	c.A = byte(float32(c1.A) * f + float32(c2.A) * (1.0 - f))
+	c.R = gl.Ubyte(float32(c1.R) * f + float32(c2.R) * (1.0 - f))
+	c.G = gl.Ubyte(float32(c1.G) * f + float32(c2.G) * (1.0 - f))
+	c.B = gl.Ubyte(float32(c1.B) * f + float32(c2.B) * (1.0 - f))
+	c.A = gl.Ubyte(float32(c1.A) * f + float32(c2.A) * (1.0 - f))
 	return c
 }
 
@@ -145,10 +146,10 @@ func mandelbrotProcessRequest(req *MandelbrotRequest) []byte {
 
 			offset := y * req.Width * 4 + x * 4
 			color := mandelbrotAt(c)
-			data[offset+0] = color.R
-			data[offset+1] = color.G
-			data[offset+2] = color.B
-			data[offset+3] = color.A
+			data[offset+0] = byte(color.R)
+			data[offset+1] = byte(color.G)
+			data[offset+2] = byte(color.B)
+			data[offset+3] = byte(color.A)
 		}
 		select {
 		case <-req.Discarder:
@@ -297,17 +298,17 @@ func (self *MandelbrotQueue) Update() {
 //-------------------------------------------------------------------------
 
 type Point struct {
-	X, Y int
+	X, Y gl.Int
 }
 
-func MinInt(i1, i2 int) int {
+func MinInt(i1, i2 gl.Int) gl.Int {
 	if i1 < i2 {
 		return i1
 	}
 	return i2
 }
 
-func MaxInt(i1, i2 int) int {
+func MaxInt(i1, i2 gl.Int) gl.Int {
 	if i1 > i2 {
 		return i1
 	}
@@ -412,13 +413,13 @@ func texCoordsFromSelection(p1, p2 Point, w, h int, tcold TexCoords) (tc TexCoor
 	return
 }
 
-func reuploadTexture(tex *gl.Texture, w, h int, data []byte) {
+func reuploadTexture(tex *gl.Uint, w, h int, data []byte) {
 	if *tex > 0 {
-		tex.Bind(gl.TEXTURE_2D)
-		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, data)
-
+		gl.BindTexture(gl.TEXTURE_2D, *tex)
+		gl.TexImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.Sizei(w), gl.Sizei(h), 0,
+			gl.RGBA, gl.UNSIGNED_BYTE, gl.Pointer(&data[0]))
 		if gl.GetError() != gl.NO_ERROR {
-			tex.Delete()
+			gl.DeleteTextures(1, tex)
 			panic("Failed to reupload texture")
 		}
 		return
@@ -429,7 +430,7 @@ func reuploadTexture(tex *gl.Texture, w, h int, data []byte) {
 //-------------------------------------------------------------------------
 
 type Tile struct {
-	Texture [2]gl.Texture	// two LODs
+	Texture [2]gl.Uint	// two LODs
 	CurrentLOD int		// -1 if no texture available
 
 	W, H int
@@ -503,10 +504,10 @@ func (self *Tile) Draw() {
 		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
 		gl.Color3ub(255, 255, 255)
 	case 0:
-		self.Texture[0].Bind(gl.TEXTURE_2D)
+		gl.BindTexture(gl.TEXTURE_2D, self.Texture[0])
 		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
 	case 1:
-		self.Texture[1].Bind(gl.TEXTURE_2D)
+		gl.BindTexture(gl.TEXTURE_2D, self.Texture[1])
 		drawQuad(self.X, self.Y, self.W, self.H, 0, 0, 1, 1)
 	default:
 		panic("unreachable")
@@ -601,7 +602,7 @@ func overlaps(r1, r2 Rect) bool {
 }
 
 func (self *TileManager) MoveRequest(what Rect) {
-	// in move request we have to be careful with tiles, 
+	// in move request we have to be careful with tiles,
 	// because some of them are pretty valid
 	tilew := what.W / float64(self.Div)
 	tileh := what.H / float64(self.Div)
@@ -699,6 +700,7 @@ func main() {
 	if *workers <= 0 {
 		*workers = 1
 	}
+	runtime.GOMAXPROCS(*workers+1)
 	buildPalette()
 	sdl.Init(sdl.INIT_VIDEO)
 	defer sdl.Quit()
@@ -713,8 +715,8 @@ func main() {
 
 	sdl.WM_SetCaption("Gomandel", "Gomandel")
 
-	if gl.Init() != 0 {
-		panic("glew error")
+	if err := gl.Init(); err != nil {
+		panic(err)
 	}
 
 	gl.Enable(gl.TEXTURE_2D)
@@ -740,19 +742,24 @@ func main() {
 	running := true
 	for running {
 		for {
-			event := sdl.PollEvent()
+			var event interface{}
+			select {
+			case event = <-sdl.Events:
+			default:
+			}
+
 			if event == nil {
 				break
 			}
 
 			switch e := event.(type) {
-			case *sdl.QuitEvent:
+			case sdl.QuitEvent:
 				running = false
-			case *sdl.MouseButtonEvent:
+			case sdl.MouseButtonEvent:
 				if e.Type == sdl.MOUSEBUTTONDOWN {
 					dndDragging = true
-					dndStart.X = int(e.X)
-					dndStart.Y = int(e.Y)
+					dndStart.X = gl.Int(e.X)
+					dndStart.Y = gl.Int(e.Y)
 					dndEnd = dndStart
 					if e.Button == 3 {
 						dnd3 = true
@@ -761,8 +768,8 @@ func main() {
 					}
 				} else {
 					dndDragging = false
-					dndEnd.X = int(e.X)
-					dndEnd.Y = int(e.Y)
+					dndEnd.X = gl.Int(e.X)
+					dndEnd.Y = gl.Int(e.Y)
 
 					switch e.Button {
 					case 1:
@@ -775,16 +782,16 @@ func main() {
 						dnd3 = false
 					}
 				}
-			case *sdl.MouseMotionEvent:
+			case sdl.MouseMotionEvent:
 				if dnd3 {
-					dndEnd.X = int(e.X)
-					dndEnd.Y = int(e.Y)
+					dndEnd.X = gl.Int(e.X)
+					dndEnd.Y = gl.Int(e.Y)
 					rect = moveRectBy(rect, dndStart, dndEnd, 512, 512)
 					tm.MoveRequest(rect)
 					dndStart = dndEnd
 				} else if dndDragging {
-					dndEnd.X = int(e.X)
-					dndEnd.Y = int(e.Y)
+					dndEnd.X = gl.Int(e.X)
+					dndEnd.Y = gl.Int(e.Y)
 				}
 			}
 		}
